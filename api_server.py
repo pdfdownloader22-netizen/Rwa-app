@@ -1,32 +1,23 @@
 import threading
+import traceback
 from functools import wraps
-from flask import Flask, request, jsonify, g
-from flask_cors import CORS
+from flask import Flask, request, jsonify, g, make_response
 import config
 from db_manager import db_manager
 from security_shield import crypto_shield, security_guard
 
 app = Flask(__name__)
 
-# Strict CORS — sirf whitelisted websites & Admin Panel allowed
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": config.ALLOWED_ORIGINS if config.STRICT_SECURITY_ENABLED else "*",
-            "methods": ["GET", "POST", "DELETE", "OPTIONS"],
-            "allow_headers": [
-                "Content-Type",
-                "X-RWA-Ts",
-                "X-RWA-Sign",
-                "X-RWA-Enc",
-                "X-RWA-App",
-                "X-RWA-Device",
-                "X-Admin-Token",
-                "X-Admin-Key"
-            ]
-        }
-    }
+# Render env se aane wale extra spaces, quotes ya trailing slash auto-clean
+config.ALLOWED_ORIGINS = [
+    str(o).strip().strip('"').strip("'").rstrip("/").lower()
+    for o in (config.ALLOWED_ORIGINS or [])
+    if str(o).strip().strip('"').strip("'")
+]
+
+ALLOWED_HEADERS_STR = (
+    "Content-Type, X-RWA-Ts, X-RWA-Sign, X-RWA-Enc, "
+    "X-RWA-App, X-RWA-Device, X-Admin-Token, X-Admin-Key"
 )
 
 notify_callbacks = {
@@ -41,6 +32,40 @@ def trigger_async(key, *args):
     fn = notify_callbacks.get(key)
     if callable(fn):
         threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+# =========================================================
+# CRASH-PROOF MANUAL CORS HANDLER (ZERO FLASK-CORS 500 BUG)
+# =========================================================
+def _apply_cors_headers(resp):
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    origin_low = origin.lower()
+    if not config.STRICT_SECURITY_ENABLED:
+        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+    elif origin_low and origin_low in config.ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = ALLOWED_HEADERS_STR
+    resp.headers["Access-Control-Max-Age"] = "600"
+    return resp
+
+
+@app.after_request
+def attach_cors_after_request(resp):
+    return _apply_cors_headers(resp)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(err):
+    tb = traceback.format_exc()
+    print(f"❌ API ERROR on {request.path}: {err}\n{tb}")
+    try:
+        db_manager.log_error("Backend500", str(err), user_id=getattr(g, "client_ip", "Server"), stack=tb[:1000])
+    except Exception:
+        pass
+    resp = make_response(jsonify({"status": "error", "message": f"Server error: {str(err)[:180]}"}), 500)
+    return _apply_cors_headers(resp)
 
 
 # =========================================================
@@ -71,7 +96,8 @@ def sec_json(data_obj, status_code=200):
 @app.before_request
 def enforce_ultra_security_shield():
     if request.method == "OPTIONS":
-        return "", 204
+        resp = make_response("", 204)
+        return _apply_cors_headers(resp)
 
     # Render / UptimeRobot health probe (zero sensitive data exposed)
     if request.path == "/":
@@ -109,7 +135,7 @@ def enforce_ultra_security_shield():
     if not security_guard.is_origin_allowed(request):
         origin_seen = security_guard.extract_request_origin(request) or "Unknown/Direct"
         db_manager.log_error("OriginShield", f"Blocked unauthorized origin: {origin_seen} on {request.path}", user_id=ip)
-        return jsonify({"status": "error", "message": "Unauthorized origin"}), 403
+        return jsonify({"status": "error", "message": f"Unauthorized origin: {origin_seen}"}), 403
 
     # 4. Dynamic HMAC-SHA256 Request Signature + Timestamp Check
     raw_body_str = request.get_data(cache=True, as_text=True) or ""
@@ -134,7 +160,7 @@ def require_admin(fn):
         if sess_tok and security_guard.verify_admin_session_token(sess_tok):
             return fn(*args, **kwargs)
 
-        # Fallback: Master Key (e.g. direct admin tools)
+        # Fallback: Master Key
         provided_key = (request.headers.get("X-Admin-Key") or "").strip()
         if provided_key and provided_key == config.ADMIN_PANEL_KEY:
             return fn(*args, **kwargs)
