@@ -26,7 +26,7 @@ def _clean_doc(doc):
 # THREAD-SAFE IN-MEMORY RAM CACHE (HIGH-TRAFFIC ANTI-CRASH)
 # =========================================================
 class ThreadSafeTTLCache:
-    def __init__(self, max_items=600):
+    def __init__(self, max_items=800):
         self._store = {}
         self._lock = threading.RLock()
         self._max_items = max_items
@@ -85,7 +85,7 @@ ram_cache = ThreadSafeTTLCache(max_items=800)
 
 
 # =========================================================
-# UNLIMITED CONTENT MONGODB VAULT MANAGER (ZERO DUPLICATES)
+# UNLIMITED CONTENT MONGODB VAULT MANAGER (450 MB HARD CAP)
 # =========================================================
 class ContentVaultManager:
     def __init__(self):
@@ -128,10 +128,6 @@ class ContentVaultManager:
                 print(f"❌ Failed connecting Content Vault {err_msg}")
 
     def attach_fallback_dbs(self, user_dbs):
-        """
-        Agar user ne abhi tak alag CONTENT_MONGO_URI set nahi kiya hai,
-        toh existing cluster fallback ke roop mein kaam karega taaki kuch crash na ho.
-        """
         if self.dbs or not user_dbs:
             return
         for entry in user_dbs:
@@ -171,18 +167,22 @@ class ContentVaultManager:
             return 0.0
 
     def pick_best_shard(self):
+        """
+        STRICT 450 MB HARD CAP:
+        - Automatically picks the first shard below MAX_CONTENT_DB_SIZE_MB (450 MB).
+        - If ALL connected shards are >= 450 MB, returns None so scanner pauses and waits
+          until a new CONTENT_MONGO_URI_N is added!
+        """
         if not self.dbs:
             return None
-        best = self.dbs[0]
-        min_mb = float("inf")
         for entry in self.dbs:
             mb = self.get_db_size_mb(entry)
             if mb < config.MAX_CONTENT_DB_SIZE_MB:
                 return entry
-            if mb < min_mb:
-                min_mb = mb
-                best = entry
-        return best
+        return None
+
+    def has_available_storage(self):
+        return self.pick_best_shard() is not None
 
     def _find_test_data_shard(self, test_id):
         tid = str(test_id).strip()
@@ -193,6 +193,9 @@ class ContentVaultManager:
             except Exception:
                 continue
         return None
+
+    def has_full_test(self, test_id):
+        return self._find_test_data_shard(test_id) is not None
 
     @staticmethod
     def _compute_content_hash(sections, questions):
@@ -258,7 +261,6 @@ class ContentVaultManager:
             return []
         try:
             docs = [_clean_doc(d) for d in primary["db"].vault_series.find().sort("ts", DESCENDING)]
-            # Attach saved tests count per series
             counts_map = {}
             full_map = {}
             for t in primary["db"].vault_test_titles.find({}, {"series_id": 1, "has_full_bank": 1}):
@@ -414,7 +416,7 @@ class ContentVaultManager:
             return []
 
     # ---------------------------------------------------------
-    # 4. FULL TEST TERMS + QUESTIONS VAULT (AUTO-SHARDED, ZERO DUPLICATES)
+    # 4. FULL TEST TERMS + QUESTIONS VAULT (450 MB HARD CAP, ZERO DUPLICATES)
     # ---------------------------------------------------------
     def save_full_test_payload(self, payload):
         tid = str(payload.get("test_id") or "").strip()
@@ -435,14 +437,16 @@ class ContentVaultManager:
         if existing_shard:
             existing_doc = existing_shard["db"].vault_test_data.find_one({"test_id": tid}, {"content_hash": 1})
             if existing_doc and existing_doc.get("content_hash") == new_hash:
-                # Exact same updated JSON already saved -> ZERO duplicate write!
                 return {"saved": True, "dedup_skipped": True, "shard": existing_shard["label"], "questions_count": len(questions)}
-            target_shard = existing_shard
+            if self.get_db_size_mb(existing_shard) >= config.MAX_CONTENT_DB_SIZE_MB:
+                target_shard = self.pick_best_shard()
+            else:
+                target_shard = existing_shard
         else:
             target_shard = self.pick_best_shard()
 
         if not target_shard:
-            return {"saved": False, "reason": "no_vault_db"}
+            return {"saved": False, "storage_full": True, "reason": f"All Content Vault DBs reached {config.MAX_CONTENT_DB_SIZE_MB} MB limit!"}
 
         now_str = _now_ist_str()
         now_ts = int(time.time())
@@ -470,7 +474,6 @@ class ContentVaultManager:
                 upsert=True
             )
 
-            # Also keep catalog index updated on primary vault DB
             primary = self.get_primary_db()
             if primary:
                 primary["db"].vault_test_titles.update_one(
@@ -575,6 +578,7 @@ class ContentVaultManager:
         total_full_banks = 0
         total_questions_archived = 0
         per_shard = []
+        any_space_left = False
 
         if primary:
             try:
@@ -593,6 +597,9 @@ class ContentVaultManager:
                 ]))
                 q_cnt = int(agg[0]["total_q"]) if agg else 0
                 mb = self.get_db_size_mb(entry)
+                is_full = mb >= config.MAX_CONTENT_DB_SIZE_MB
+                if not is_full:
+                    any_space_left = True
                 total_full_banks += fb_cnt
                 total_questions_archived += q_cnt
                 per_shard.append({
@@ -600,7 +607,8 @@ class ContentVaultManager:
                     "full_banks": fb_cnt,
                     "questions": q_cnt,
                     "size_mb": mb,
-                    "max_mb": 512.0
+                    "max_mb": config.MAX_CONTENT_DB_SIZE_MB,
+                    "is_full": is_full
                 })
             except Exception:
                 per_shard.append({"label": entry["label"], "error": True})
@@ -608,6 +616,8 @@ class ContentVaultManager:
         summary = {
             "using_dedicated": self.using_dedicated,
             "connected_vault_dbs": len(self.dbs),
+            "storage_full": (len(self.dbs) > 0 and not any_space_left),
+            "max_mb_per_db": config.MAX_CONTENT_DB_SIZE_MB,
             "connection_errors": self.connection_errors,
             "total_series": total_series,
             "total_folders": total_folders,
@@ -618,7 +628,7 @@ class ContentVaultManager:
             "ram_cache": ram_cache.stats(),
             "updated_at": _now_ist_str()
         }
-        ram_cache.set("vault_summary:main", summary, ttl_sec=30)
+        ram_cache.set("vault_summary:main", summary, ttl_sec=25)
         return summary
 
 
