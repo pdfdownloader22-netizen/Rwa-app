@@ -8,6 +8,7 @@ import config
 from api_server import app, notify_callbacks
 from db_manager import db_manager
 from vault_manager import vault_manager
+from vault_scanner import vault_scanner
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -27,8 +28,38 @@ def send_telegram_admin_message(text):
             pass
 
 
+def start_nightly_vault_scan_scheduler():
+    """
+    Roz raat 11:00 PM se 12:00 AM IST ke beech ek baar automatic Cloud Vault Scan chalata hai.
+    - Agar sabhi Content MongoDB 450 MB full hain, toh alert dekar naye URI ka wait karega.
+    - Agar naya kuch nahi mila, toh scan turant khatam hokar agle din 11 PM ka wait karega.
+    """
+    last_scan_date = None
+
+    def _loop():
+        nonlocal last_scan_date
+        while True:
+            try:
+                now_ist = datetime.now(IST)
+                today_str = now_ist.strftime("%Y-%m-%d")
+                if now_ist.hour == config.NIGHTLY_SCAN_START_HOUR_IST and last_scan_date != today_str:
+                    last_scan_date = today_str
+                    ok, msg = vault_scanner.start_scan(mode="nightly")
+                    print(f"🕚 [Nightly Vault Scheduler] Triggered ({today_str}): ok={ok} | {msg}")
+                    if not ok and "450" in str(msg):
+                        send_telegram_admin_message(
+                            f"🚨 <b>Nightly Vault Scan Skipped (Storage Full)</b>\n{msg}\n"
+                            f"Render Environment mein naya <code>CONTENT_MONGO_URI_N</code> add karein!"
+                        )
+            except Exception as e:
+                print(f"⚠️ Nightly vault scan scheduler error: {e}")
+            time.sleep(45)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def start_nightly_digest_scheduler():
-    """Roz raat 11:00 PM IST par Telegram par full cluster + Content Vault summary bhejta hai."""
+    """Roz raat 11:55 PM IST par Telegram par full cluster + Content Vault summary bhejta hai."""
     last_sent_date = None
 
     def _loop():
@@ -37,7 +68,7 @@ def start_nightly_digest_scheduler():
             try:
                 now_ist = datetime.now(IST)
                 today_str = now_ist.strftime("%Y-%m-%d")
-                if now_ist.hour == config.NIGHTLY_DIGEST_HOUR_IST and last_sent_date != today_str:
+                if now_ist.hour == config.NIGHTLY_DIGEST_HOUR_IST and now_ist.minute >= 55 and last_sent_date != today_str:
                     last_sent_date = today_str
                     st = db_manager.get_cluster_stats()
                     vs = vault_manager.get_vault_summary()
@@ -46,7 +77,7 @@ def start_nightly_digest_scheduler():
                         for s in (st.get("per_db") or [])
                     ]) or "  • No User DBs"
                     vshard_lines = "\n".join([
-                        f"  • {s['label']}: {s.get('size_mb', 0)} MB ({s.get('full_banks', 0)} Tests)"
+                        f"  • {s['label']}: {s.get('size_mb', 0)}/{s.get('max_mb', 450)} MB ({s.get('full_banks', 0)} Tests){' [FULL]' if s.get('is_full') else ''}"
                         for s in (vs.get("per_shard") or [])
                     ]) or "  • Fallback Mode"
 
@@ -75,8 +106,9 @@ def start_nightly_digest_scheduler():
 
 
 def boot_optional_telegram_bot():
-    """Agar bot.py repo mein hai toh usko safely background thread mein start karta hai."""
     notify_callbacks["on_security_alert"] = lambda msg: send_telegram_admin_message(f"🛡️ <b>SECURITY ALERT</b>\n{msg}")
+    vault_scanner.alert_callback = send_telegram_admin_message
+
     try:
         import bot  # noqa: F401
         if hasattr(bot, "start_bot_polling"):
@@ -99,10 +131,10 @@ def boot_optional_telegram_bot():
 
 
 if __name__ == "__main__":
-    # Fallback attach if user hasn't set dedicated CONTENT_MONGO_URI yet
     vault_manager.attach_fallback_dbs(db_manager.dbs)
 
     boot_optional_telegram_bot()
+    start_nightly_vault_scan_scheduler()
     start_nightly_digest_scheduler()
 
     print(
