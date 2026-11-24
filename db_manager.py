@@ -1,3 +1,4 @@
+import hashlib
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -5,6 +6,7 @@ import requests
 from pymongo import MongoClient, DESCENDING
 import config
 from security_shield import crypto_shield, security_guard
+from vault_manager import ram_cache, vault_manager
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -15,6 +17,12 @@ def now_ist_str():
 
 def today_ist_str():
     return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def current_week_key():
+    now_ist = datetime.now(IST)
+    iso = now_ist.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
 
 
 def clean_doc(doc):
@@ -36,6 +44,17 @@ def decrypt_user_doc(doc):
     return d
 
 
+def _xp_league_tier(xp):
+    xp = int(xp or 0)
+    if xp >= 1600:
+        return "💎 Diamond"
+    if xp >= 900:
+        return "🥇 Gold"
+    if xp >= 400:
+        return "🥈 Silver"
+    return "🥉 Bronze"
+
+
 class MultiMongoManager:
     def __init__(self):
         self.dbs = []
@@ -50,7 +69,12 @@ class MultiMongoManager:
             try:
                 client = MongoClient(
                     uri,
-                    serverSelectionTimeoutMS=15000,
+                    maxPoolSize=50,
+                    minPoolSize=2,
+                    serverSelectionTimeoutMS=10000,
+                    connectTimeoutMS=10000,
+                    socketTimeoutMS=15000,
+                    retryWrites=True,
                     tls=True,
                     tlsAllowInvalidCertificates=True
                 )
@@ -63,18 +87,19 @@ class MultiMongoManager:
                     "client": client,
                     "db": db,
                 })
-                print(f"✅ Connected to MongoDB DB-{idx}")
+                print(f"✅ Connected to User MongoDB DB-{idx}")
             except Exception as e:
                 err_msg = f"DB-{idx}: {e}"
                 self.connection_errors.append(err_msg)
                 print(f"❌ Failed connecting MongoDB {err_msg}")
 
         if not self.dbs:
-            print("⚠️ WARNING: Koi bhi MongoDB connect nahi hua!")
+            print("⚠️ WARNING: Koi bhi User MongoDB connect nahi hua!")
 
     def _ensure_indexes(self, db):
         try:
             db.users.create_index("user_id", unique=True)
+            db.users.create_index([("xp_week_key", 1), ("weekly_xp", DESCENDING)])
             db.user_sync.create_index("user_id", unique=True)
             db.admin_tokens.create_index("token_hash", unique=True, sparse=True)
             db.removed_pool_tokens.create_index("token_hash", unique=True, sparse=True)
@@ -86,16 +111,16 @@ class MultiMongoManager:
             db.error_logs.create_index([("ts", DESCENDING)])
             db.audit_logs.create_index([("ts", DESCENDING)])
             db.user_messages.create_index([("user_id", 1), ("ts", DESCENDING)])
+            db.challenges.create_index("challenge_id", unique=True)
         except Exception:
             pass
 
     @staticmethod
     def _token_hash(tok):
-        import hashlib
         return hashlib.sha256(str(tok or "").strip().encode("utf-8")).hexdigest()
 
     # ---------------------------------------------------------
-    # STORAGE & SHARD ROUTING
+    # UNLIMITED SHARD STORAGE & ROUTING
     # ---------------------------------------------------------
     def get_db_size_mb(self, db_entry):
         try:
@@ -139,16 +164,20 @@ class MultiMongoManager:
         return found if found else self.pick_best_db_for_new_user()
 
     # ---------------------------------------------------------
-    # PORTAL SETTINGS, MODULE KILL-SWITCHES, VERSION & PROMO POPUP
+    # PORTAL SETTINGS, KILL-SWITCHES, VERSION & PROMO POPUP
     # ---------------------------------------------------------
     def get_portal_settings(self):
+        cached = ram_cache.get("portal_settings")
+        if cached is not None:
+            return cached
+
         defaults = {
             "maintenance_mode": False,
             "maintenance_message": "Portal abhi scheduled update par hai. Kripya thodi der baad try karein.",
             "login_alerts": True,
             "test_submit_alerts": True,
             "single_device_guard": True,
-            "app_version": "v3.0",
+            "app_version": "v4.0",
             "kill_switches": {
                 "new_login": True,
                 "paid_test_series": True,
@@ -168,14 +197,19 @@ class MultiMongoManager:
         entry = self.get_primary_db()
         if not entry:
             return defaults
-        doc = entry["db"].settings.find_one({"_id": "portal_config"})
-        if not doc:
-            entry["db"].settings.insert_one({"_id": "portal_config", **defaults})
+        try:
+            doc = entry["db"].settings.find_one({"_id": "portal_config"})
+            if not doc:
+                entry["db"].settings.insert_one({"_id": "portal_config", **defaults})
+                ram_cache.set("portal_settings", defaults, ttl_sec=45)
+                return defaults
+            merged = {**defaults, **{k: v for k, v in doc.items() if k != "_id"}}
+            merged["kill_switches"] = {**defaults["kill_switches"], **(doc.get("kill_switches") or {})}
+            merged["promo_popup"] = {**defaults["promo_popup"], **(doc.get("promo_popup") or {})}
+            ram_cache.set("portal_settings", merged, ttl_sec=45)
+            return merged
+        except Exception:
             return defaults
-        merged = {**defaults, **{k: v for k, v in doc.items() if k != "_id"}}
-        merged["kill_switches"] = {**defaults["kill_switches"], **(doc.get("kill_switches") or {})}
-        merged["promo_popup"] = {**defaults["promo_popup"], **(doc.get("promo_popup") or {})}
-        return merged
 
     def update_portal_settings(self, updates):
         entry = self.get_primary_db()
@@ -194,22 +228,37 @@ class MultiMongoManager:
             clean_upd["promo_popup"] = {**current["promo_popup"], **updates["promo_popup"]}
         clean_upd["updated_at"] = now_ist_str()
         entry["db"].settings.update_one({"_id": "portal_config"}, {"$set": clean_upd}, upsert=True)
+        ram_cache.invalidate_prefix("portal_settings")
         self.log_admin_action("UPDATE_SETTINGS", f"Updated keys: {', '.join(clean_upd.keys())}")
         return self.get_portal_settings()
 
     # ---------------------------------------------------------
-    # IP BAN ENGINE
+    # IP BAN ENGINE (CACHED FOR ZERO-OVERHEAD HIGH TRAFFIC)
     # ---------------------------------------------------------
+    def _get_banned_ips_map(self):
+        cached = ram_cache.get("banned_ips_map")
+        if cached is not None:
+            return cached
+        entry = self.get_primary_db()
+        if not entry:
+            return {}
+        try:
+            mp = {
+                str(d.get("ip", "")).strip(): d.get("reason", "IP restricted by Admin")
+                for d in entry["db"].banned_ips.find({}, {"ip": 1, "reason": 1})
+            }
+            ram_cache.set("banned_ips_map", mp, ttl_sec=45)
+            return mp
+        except Exception:
+            return {}
+
     def is_ip_banned(self, ip):
         ip_s = str(ip or "").strip()
         if not ip_s:
             return False, ""
-        entry = self.get_primary_db()
-        if not entry:
-            return False, ""
-        doc = entry["db"].banned_ips.find_one({"ip": ip_s})
-        if doc:
-            return True, doc.get("reason", "IP restricted by Admin")
+        mp = self._get_banned_ips_map()
+        if ip_s in mp:
+            return True, mp[ip_s]
         return False, ""
 
     def ban_ip(self, ip, reason="Suspicious activity", user_id=""):
@@ -228,6 +277,7 @@ class MultiMongoManager:
             }},
             upsert=True
         )
+        ram_cache.invalidate_prefix("banned_ips_map")
         self.log_admin_action("BAN_IP", f"Banned IP {ip_s} ({reason})")
         return True
 
@@ -238,6 +288,7 @@ class MultiMongoManager:
             return False
         res = entry["db"].banned_ips.delete_one({"ip": ip_s})
         if res.deleted_count > 0:
+            ram_cache.invalidate_prefix("banned_ips_map")
             self.log_admin_action("UNBAN_IP", f"Unbanned IP {ip_s}")
             return True
         return False
@@ -249,7 +300,7 @@ class MultiMongoManager:
         return [clean_doc(d) for d in entry["db"].banned_ips.find().sort("ts", DESCENDING)]
 
     # ---------------------------------------------------------
-    # USERS, ENCRYPTED STORAGE, SINGLE-DEVICE & LIVE HEARTBEAT
+    # USERS, ENCRYPTED STORAGE, SINGLE-DEVICE & HEARTBEAT
     # ---------------------------------------------------------
     def _auto_save_user_token_to_pool(self, user_id, jwt_token, owner_name="Student"):
         tok = str(jwt_token or "").strip()
@@ -277,6 +328,7 @@ class MultiMongoManager:
                 }},
                 upsert=True
             )
+            ram_cache.invalidate_prefix("public_tokens")
         except Exception:
             pass
 
@@ -306,14 +358,12 @@ class MultiMongoManager:
 
         name = payload.get("name") or existing.get("name", "N/A")
 
-        # Single-device session token tracking
         incoming_sid = str(payload.get("session_id") or "").strip()
         if is_silent_sync and existing.get("active_session_id"):
             session_id = existing.get("active_session_id")
         else:
             session_id = incoming_sid or f"sess_{uuid.uuid4().hex[:16]}"
 
-        # Track unique devices for anti-sharing detection
         devices = list(existing.get("devices") or [])
         dev_id = dev.get("device_id") or dev.get("ip") or "unknown"
         multi_device_alert = False
@@ -334,6 +384,9 @@ class MultiMongoManager:
                     d["ip"] = dev.get("ip", d.get("ip", ""))
                     d["device_type"] = dev.get("device_type", d.get("device_type", "Web"))
                     d["last_seen"] = now_str
+
+        wk = current_week_key()
+        cur_wk_xp = int(existing.get("weekly_xp", 0)) if existing.get("xp_week_key") == wk else 0
 
         update_doc = {
             "user_id": uid,
@@ -365,7 +418,10 @@ class MultiMongoManager:
             "is_blocked": bool(existing.get("is_blocked", False)),
             "block_reason": existing.get("block_reason", ""),
             "vip_badge": existing.get("vip_badge", ""),
-            "joined_date": existing.get("joined_date") or today_ist_str()
+            "joined_date": existing.get("joined_date") or today_ist_str(),
+            "xp_week_key": wk,
+            "weekly_xp": cur_wk_xp,
+            "total_xp": int(existing.get("total_xp", cur_wk_xp))
         }
 
         if not existing:
@@ -396,7 +452,9 @@ class MultiMongoManager:
             return {"valid": True}
 
         db = entry["db"]
-        u = db.users.find_one({"user_id": uid}) or {}
+        u = db.users.find_one({"user_id": uid}, {
+            "is_blocked": 1, "block_reason": 1, "force_logout": 1, "active_session_id": 1
+        }) or {}
         settings = self.get_portal_settings()
 
         if u.get("is_blocked"):
@@ -431,7 +489,7 @@ class MultiMongoManager:
         db.users.update_one({"user_id": uid}, {"$set": upd})
         return {"valid": True}
 
-    def get_live_radar_users(self, window_sec=120):
+    def get_live_radar_users(self, window_sec=180):
         cutoff = int(time.time()) - window_sec
         live_users = []
         for entry in self.dbs:
@@ -588,6 +646,136 @@ class MultiMongoManager:
         return True
 
     # ---------------------------------------------------------
+    # WEEKLY XP & STUDY LEAGUE ENGINE
+    # ---------------------------------------------------------
+    def add_user_xp(self, user_id, points, reason="Study Activity"):
+        uid = str(user_id).strip()
+        pts = max(0, min(500, int(points or 0)))
+        if not uid or pts <= 0:
+            return None
+        entry = self.get_or_assign_user_db(uid)
+        if not entry:
+            return None
+        db = entry["db"]
+        wk = current_week_key()
+        u = db.users.find_one({"user_id": uid}, {"xp_week_key": 1, "weekly_xp": 1, "total_xp": 1}) or {}
+        prev_wk = u.get("xp_week_key")
+        new_weekly = (int(u.get("weekly_xp", 0)) if prev_wk == wk else 0) + pts
+        new_total = int(u.get("total_xp", 0)) + pts
+        db.users.update_one(
+            {"user_id": uid},
+            {"$set": {
+                "xp_week_key": wk,
+                "weekly_xp": new_weekly,
+                "total_xp": new_total,
+                "last_xp_reason": str(reason)[:80],
+                "last_seen": now_ist_str(),
+                "last_seen_ts": int(time.time())
+            }},
+            upsert=True
+        )
+        ram_cache.invalidate_prefix("xp_league")
+        return {"weekly_xp": new_weekly, "total_xp": new_total, "tier": _xp_league_tier(new_weekly), "week": wk}
+
+    def get_weekly_xp_league(self, current_user_id=None, limit=25):
+        wk = current_week_key()
+        all_rows = ram_cache.get(f"xp_league:{wk}")
+        if all_rows is None:
+            rows = []
+            for entry in self.dbs:
+                try:
+                    cursor = entry["db"].users.find(
+                        {"xp_week_key": wk, "weekly_xp": {"$gt": 0}, "is_blocked": {"$ne": True}},
+                        {"user_id": 1, "name": 1, "weekly_xp": 1, "total_xp": 1, "study_streak": 1, "vip_badge": 1}
+                    )
+                    for u in cursor:
+                        wxp = int(u.get("weekly_xp", 0))
+                        rows.append({
+                            "user_id": str(u.get("user_id", "")),
+                            "name": u.get("name") or "RWA Student",
+                            "vip_badge": u.get("vip_badge", ""),
+                            "weekly_xp": wxp,
+                            "total_xp": int(u.get("total_xp", wxp)),
+                            "streak": int(u.get("study_streak", 1)),
+                            "tier": _xp_league_tier(wxp)
+                        })
+                except Exception:
+                    continue
+            rows.sort(key=lambda x: (-x["weekly_xp"], -x["streak"], -x["total_xp"]))
+            all_rows = rows
+            ram_cache.set(f"xp_league:{wk}", all_rows, ttl_sec=30)
+
+        my_info = None
+        if current_user_id:
+            cuid = str(current_user_id).strip()
+            for idx, r in enumerate(all_rows, start=1):
+                if r["user_id"] == cuid:
+                    my_info = {**r, "rank": idx}
+                    break
+            if not my_info:
+                my_info = {"user_id": cuid, "weekly_xp": 0, "total_xp": 0, "tier": _xp_league_tier(0), "rank": None}
+
+        return {
+            "week": wk,
+            "total_ranked": len(all_rows),
+            "my_stats": my_info,
+            "top_players": [{**r, "rank": i} for i, r in enumerate(all_rows[:limit], start=1)]
+        }
+
+    # ---------------------------------------------------------
+    # 1-V-1 FRIEND CHALLENGE ENGINE
+    # ---------------------------------------------------------
+    def create_friend_challenge(self, payload):
+        primary = self.get_primary_db()
+        if not primary:
+            return None
+        cid = f"ch_{uuid.uuid4().hex[:8]}"
+        doc = {
+            "challenge_id": cid,
+            "test_id": str(payload.get("test_id") or "").strip(),
+            "series_id": str(payload.get("series_id") or "").strip(),
+            "test_title": str(payload.get("test_title") or "Mock Test").strip()[:140],
+            "challenger_id": str(payload.get("user_id") or "").strip(),
+            "challenger_name": str(payload.get("user_name") or "Student").strip()[:60],
+            "challenger_score": float(payload.get("score", 0)),
+            "max_marks": float(payload.get("max_marks", 100)),
+            "challenger_accuracy": float(payload.get("accuracy", 0)),
+            "challenger_time_sec": int(payload.get("time_taken_sec", 0)),
+            "attempts": [],
+            "created_at": now_ist_str(),
+            "ts": int(time.time())
+        }
+        primary["db"].challenges.insert_one(doc)
+        return clean_doc(doc)
+
+    def get_friend_challenge(self, challenge_id):
+        cid = str(challenge_id or "").strip()
+        primary = self.get_primary_db()
+        if not primary or not cid:
+            return None
+        doc = primary["db"].challenges.find_one({"challenge_id": cid})
+        return clean_doc(doc) if doc else None
+
+    def complete_friend_challenge(self, challenge_id, payload):
+        cid = str(challenge_id or "").strip()
+        primary = self.get_primary_db()
+        if not primary or not cid:
+            return None
+        entry = {
+            "user_id": str(payload.get("user_id") or "").strip(),
+            "user_name": str(payload.get("user_name") or "Friend").strip()[:60],
+            "score": float(payload.get("score", 0)),
+            "accuracy": float(payload.get("accuracy", 0)),
+            "time_taken_sec": int(payload.get("time_taken_sec", 0)),
+            "completed_at": now_ist_str()
+        }
+        primary["db"].challenges.update_one(
+            {"challenge_id": cid},
+            {"$push": {"attempts": {"$each": [entry], "$slice": -20}}}
+        )
+        return self.get_friend_challenge(cid)
+
+    # ---------------------------------------------------------
     # PERSONAL USER MESSAGES & TARGETED GROUP BROADCASTS
     # ---------------------------------------------------------
     def send_personal_message(self, user_id, title, message, msg_type="admin_msg"):
@@ -670,6 +858,11 @@ class MultiMongoManager:
     # ADMIN CLOUD TOKEN POOL & DEAD TOKEN SCANNER
     # ---------------------------------------------------------
     def get_all_admin_tokens(self, for_admin=False):
+        if not for_admin:
+            cached = ram_cache.get("public_tokens")
+            if cached is not None:
+                return cached
+
         tokens = []
         seen = set()
         for entry in self.dbs:
@@ -690,16 +883,18 @@ class MultiMongoManager:
                                 "token": raw_tok,
                                 "added_at": doc.get("added_at", "")
                             })
-                        else:
-                            if not is_exp:
-                                tokens.append({
-                                    "userId": str(doc.get("userId") or doc.get("id") or ""),
-                                    "id": str(doc.get("userId") or doc.get("id") or ""),
-                                    "label": "Cloud Server",
-                                    "token": raw_tok
-                                })
+                        elif not is_exp:
+                            tokens.append({
+                                "userId": str(doc.get("userId") or doc.get("id") or ""),
+                                "id": str(doc.get("userId") or doc.get("id") or ""),
+                                "label": "Cloud Server",
+                                "token": raw_tok
+                            })
             except Exception:
                 continue
+
+        if not for_admin:
+            ram_cache.set("public_tokens", tokens, ttl_sec=60)
         return tokens
 
     def add_admin_token(self, user_id, token, label="Cloud Server"):
@@ -724,6 +919,7 @@ class MultiMongoManager:
             }},
             upsert=True
         )
+        ram_cache.invalidate_prefix("public_tokens")
         self.log_admin_action("ADD_CLOUD_TOKEN", f"Added token for UID #{user_id}")
         return True
 
@@ -753,6 +949,7 @@ class MultiMongoManager:
                     upsert=True
                 )
         if deleted > 0:
+            ram_cache.invalidate_prefix("public_tokens")
             self.log_admin_action("DELETE_CLOUD_TOKEN", f"Removed {deleted} token(s) (UID={uid or 'by_token'})")
         return deleted > 0
 
@@ -767,6 +964,7 @@ class MultiMongoManager:
                     removed += 1
                 else:
                     kept += 1
+        ram_cache.invalidate_prefix("public_tokens")
         self.log_admin_action("CLEAN_DEAD_TOKENS", f"Removed {removed} expired tokens, kept {kept} live")
         return {"removed": removed, "kept": kept}
 
@@ -937,7 +1135,7 @@ class MultiMongoManager:
         return clean_doc(doc) if doc else {}
 
     # ---------------------------------------------------------
-    # TEST ATTEMPTS, ALL-INDIA LEADERBOARD & MODERATOR
+    # TEST ATTEMPTS, ALL-INDIA LEADERBOARD & XP AWARD
     # ---------------------------------------------------------
     def save_test_attempt(self, payload):
         uid = str(payload.get("user_id") or "").strip()
@@ -973,14 +1171,20 @@ class MultiMongoManager:
             "ts": now_ts
         }
         entry["db"].test_attempts.insert_one(attempt_doc)
+        ram_cache.invalidate_prefix(f"lb:{test_id}")
+
+        # Auto award Weekly XP (Base 50 + accuracy bonus up to 50)
+        xp_earned = 50 + int(round(min(100.0, max(0.0, attempt_doc["accuracy"])) * 0.5))
+        xp_info = self.add_user_xp(uid, xp_earned, f"Mock Test: {attempt_doc['test_title']}")
+
         self.log_activity(
             uid,
             "TEST_SUBMIT",
-            f"{attempt_doc['test_title']} | Score: {attempt_doc['score']}/{attempt_doc['max_marks']} ({attempt_doc['accuracy']}%)",
+            f"{attempt_doc['test_title']} | Score: {attempt_doc['score']}/{attempt_doc['max_marks']} ({attempt_doc['accuracy']}%) [+{xp_earned} XP]",
             meta={"name": attempt_doc["user_name"], "test_id": test_id, "score": attempt_doc["score"]}
         )
         lb = self.get_test_leaderboard(test_id, uid)
-        return {"attempt": clean_doc(attempt_doc), "leaderboard": lb}
+        return {"attempt": clean_doc(attempt_doc), "leaderboard": lb, "xp_earned": xp_earned, "xp_info": xp_info}
 
     def delete_test_attempt(self, attempt_id):
         aid = str(attempt_id or "").strip()
@@ -989,36 +1193,40 @@ class MultiMongoManager:
         for entry in self.dbs:
             res = entry["db"].test_attempts.delete_one({"attempt_id": aid})
             if res.deleted_count > 0:
+                ram_cache.invalidate_prefix("lb:")
                 self.log_admin_action("DELETE_SCORE", f"Deleted attempt {aid} from leaderboard")
                 return True
         return False
 
     def get_test_leaderboard(self, test_id, current_user_id=None):
         tid = str(test_id).strip()
-        best_by_user = {}
-        for entry in self.dbs:
-            try:
-                for doc in entry["db"].test_attempts.find({"test_id": tid}):
-                    u = str(doc.get("user_id", ""))
-                    sc = float(doc.get("score", 0))
-                    if u not in best_by_user or sc > best_by_user[u]["score"]:
-                        best_by_user[u] = {
-                            "attempt_id": doc.get("attempt_id", ""),
-                            "user_id": u,
-                            "user_name": doc.get("user_name", "Student"),
-                            "vip_badge": doc.get("vip_badge", ""),
-                            "score": sc,
-                            "max_marks": float(doc.get("max_marks", 100)),
-                            "accuracy": float(doc.get("accuracy", 0)),
-                            "correct": int(doc.get("correct", 0)),
-                            "incorrect": int(doc.get("incorrect", 0)),
-                            "time_taken_sec": int(doc.get("time_taken_sec", 0)),
-                            "submitted_at": doc.get("submitted_at", "")
-                        }
-            except Exception:
-                continue
+        ranked = ram_cache.get(f"lb:{tid}")
+        if ranked is None:
+            best_by_user = {}
+            for entry in self.dbs:
+                try:
+                    for doc in entry["db"].test_attempts.find({"test_id": tid}):
+                        u = str(doc.get("user_id", ""))
+                        sc = float(doc.get("score", 0))
+                        if u not in best_by_user or sc > best_by_user[u]["score"]:
+                            best_by_user[u] = {
+                                "attempt_id": doc.get("attempt_id", ""),
+                                "user_id": u,
+                                "user_name": doc.get("user_name", "Student"),
+                                "vip_badge": doc.get("vip_badge", ""),
+                                "score": sc,
+                                "max_marks": float(doc.get("max_marks", 100)),
+                                "accuracy": float(doc.get("accuracy", 0)),
+                                "correct": int(doc.get("correct", 0)),
+                                "incorrect": int(doc.get("incorrect", 0)),
+                                "time_taken_sec": int(doc.get("time_taken_sec", 0)),
+                                "submitted_at": doc.get("submitted_at", "")
+                            }
+                except Exception:
+                    continue
+            ranked = sorted(best_by_user.values(), key=lambda x: (-x["score"], -x["accuracy"], x["time_taken_sec"]))
+            ram_cache.set(f"lb:{tid}", ranked, ttl_sec=25)
 
-        ranked = sorted(best_by_user.values(), key=lambda x: (-x["score"], -x["accuracy"], x["time_taken_sec"]))
         total_students = len(ranked)
         topper = ranked[0] if ranked else None
         avg_score = round(sum(x["score"] for x in ranked) / total_students, 2) if total_students else 0
@@ -1053,7 +1261,7 @@ class MultiMongoManager:
         return [clean_doc(d) for d in docs]
 
     # ---------------------------------------------------------
-    # DAILY RAPID QUIZ, CURRENT AFFAIRS CAPSULES & SCHEDULED MOCKS
+    # DAILY QUIZ, CURRENT AFFAIRS CAPSULES & SCHEDULED MOCKS
     # ---------------------------------------------------------
     def publish_daily_quiz(self, questions, title="Daily 5-Min Rapid Quiz"):
         entry = self.get_primary_db()
@@ -1067,15 +1275,22 @@ class MultiMongoManager:
             "updated_at": now_ist_str()
         }
         entry["db"].content_hub.update_one({"_id": "active_daily_quiz"}, {"$set": doc}, upsert=True)
+        ram_cache.invalidate_prefix("content_daily_quiz")
         self.log_admin_action("PUBLISH_QUIZ", f"Published {len(questions)} daily quiz Qs")
         return True
 
     def get_daily_quiz(self):
+        cached = ram_cache.get("content_daily_quiz")
+        if cached is not None:
+            return cached
         entry = self.get_primary_db()
         if not entry:
             return None
         doc = entry["db"].content_hub.find_one({"_id": "active_daily_quiz"})
-        return clean_doc(doc) if doc else None
+        res = clean_doc(doc) if doc else None
+        if res is not None:
+            ram_cache.set("content_daily_quiz", res, ttl_sec=60)
+        return res
 
     def add_ca_capsule(self, title, points, category="Current Affairs"):
         entry = self.get_primary_db()
@@ -1091,20 +1306,29 @@ class MultiMongoManager:
             "ts": int(time.time())
         }
         entry["db"].ca_capsules.insert_one(doc)
+        ram_cache.invalidate_prefix("content_ca")
         self.log_admin_action("PUBLISH_CA", f"Added CA Capsule: {doc['title']}")
         return clean_doc(doc)
 
     def get_ca_capsules(self, limit=25):
+        cached = ram_cache.get(f"content_ca:{limit}")
+        if cached is not None:
+            return cached
         entry = self.get_primary_db()
         if not entry:
             return []
-        return [clean_doc(d) for d in entry["db"].ca_capsules.find().sort("ts", DESCENDING).limit(limit)]
+        res = [clean_doc(d) for d in entry["db"].ca_capsules.find().sort("ts", DESCENDING).limit(limit)]
+        ram_cache.set(f"content_ca:{limit}", res, ttl_sec=60)
+        return res
 
     def delete_ca_capsule(self, cid):
         entry = self.get_primary_db()
         if not entry:
             return False
-        return entry["db"].ca_capsules.delete_one({"capsule_id": cid}).deleted_count > 0
+        ok = entry["db"].ca_capsules.delete_one({"capsule_id": cid}).deleted_count > 0
+        if ok:
+            ram_cache.invalidate_prefix("content_ca")
+        return ok
 
     def save_scheduled_mock(self, payload):
         entry = self.get_primary_db()
@@ -1122,20 +1346,29 @@ class MultiMongoManager:
             "ts": int(time.time())
         }
         entry["db"].scheduled_mocks.update_one({"sched_id": doc["sched_id"]}, {"$set": doc}, upsert=True)
+        ram_cache.invalidate_prefix("content_sched")
         self.log_admin_action("SCHEDULE_MOCK", f"{doc['title']} (Test #{doc['test_id']})")
         return clean_doc(doc)
 
     def get_scheduled_mocks(self):
+        cached = ram_cache.get("content_sched")
+        if cached is not None:
+            return cached
         entry = self.get_primary_db()
         if not entry:
             return []
-        return [clean_doc(d) for d in entry["db"].scheduled_mocks.find({"active": True}).sort("ts", DESCENDING).limit(15)]
+        res = [clean_doc(d) for d in entry["db"].scheduled_mocks.find({"active": True}).sort("ts", DESCENDING).limit(15)]
+        ram_cache.set("content_sched", res, ttl_sec=60)
+        return res
 
     def delete_scheduled_mock(self, sched_id):
         entry = self.get_primary_db()
         if not entry:
             return False
-        return entry["db"].scheduled_mocks.delete_one({"sched_id": sched_id}).deleted_count > 0
+        ok = entry["db"].scheduled_mocks.delete_one({"sched_id": sched_id}).deleted_count > 0
+        if ok:
+            ram_cache.invalidate_prefix("content_sched")
+        return ok
 
     # ---------------------------------------------------------
     # NOTICES & 2-WAY REPORTS
@@ -1154,14 +1387,20 @@ class MultiMongoManager:
             "ts": int(time.time())
         }
         entry["db"].notices.insert_one(doc)
+        ram_cache.invalidate_prefix("notices:")
         self.log_admin_action("ADD_NOTICE", doc["title"])
         return clean_doc(doc)
 
     def get_active_notices(self, limit=15):
+        cached = ram_cache.get(f"notices:{limit}")
+        if cached is not None:
+            return cached
         entry = self.get_primary_db()
         if not entry:
             return []
-        return [clean_doc(d) for d in entry["db"].notices.find({"active": True}).sort("ts", DESCENDING).limit(limit)]
+        res = [clean_doc(d) for d in entry["db"].notices.find({"active": True}).sort("ts", DESCENDING).limit(limit)]
+        ram_cache.set(f"notices:{limit}", res, ttl_sec=45)
+        return res
 
     def delete_notice(self, notice_id):
         entry = self.get_primary_db()
@@ -1169,6 +1408,7 @@ class MultiMongoManager:
             return False
         ok = entry["db"].notices.delete_one({"notice_id": notice_id}).deleted_count > 0
         if ok:
+            ram_cache.invalidate_prefix("notices:")
             self.log_admin_action("DELETE_NOTICE", notice_id)
         return ok
 
@@ -1258,7 +1498,7 @@ class MultiMongoManager:
         user_meta = {}
         for entry in self.dbs:
             try:
-                for u in entry["db"].users.find({"is_blocked": {"$ne": True}}, {"user_id": 1, "name": 1, "study_streak": 1, "vip_badge": 1, "state_district": 1}):
+                for u in entry["db"].users.find({"is_blocked": {"$ne": True}}, {"user_id": 1, "name": 1, "study_streak": 1, "vip_badge": 1, "state_district": 1, "weekly_xp": 1}):
                     user_meta[str(u["user_id"])] = u
                 for t in entry["db"].test_attempts.find({}, {"user_id": 1, "user_name": 1, "score": 1, "max_marks": 1, "accuracy": 1}):
                     uid = str(t.get("user_id", ""))
@@ -1285,7 +1525,8 @@ class MultiMongoManager:
                 "tests_given": row["tests"],
                 "avg_accuracy": round(row["acc_sum"] / cnt, 1),
                 "avg_score_pct": round(row["score_pct_sum"] / cnt, 1),
-                "streak": int(um.get("study_streak", 1))
+                "streak": int(um.get("study_streak", 1)),
+                "weekly_xp": int(um.get("weekly_xp", 0))
             })
         board.sort(key=lambda x: (-x["tests_given"], -x["avg_accuracy"], -x["streak"]))
         return board[:limit]
@@ -1348,9 +1589,18 @@ class MultiMongoManager:
             try:
                 entry["client"].admin.command("ping")
                 ms = round((time.time() - t0) * 1000, 1)
-                shards_diag.append({"name": entry["label"], "ok": True, "latency_ms": ms, "size_mb": self.get_db_size_mb(entry)})
+                shards_diag.append({"name": f"User {entry['label']}", "ok": True, "latency_ms": ms, "size_mb": self.get_db_size_mb(entry)})
             except Exception as e:
-                shards_diag.append({"name": entry["label"], "ok": False, "error": str(e)[:120]})
+                shards_diag.append({"name": f"User {entry['label']}", "ok": False, "error": str(e)[:120]})
+
+        for ventry in vault_manager.dbs:
+            t0 = time.time()
+            try:
+                ventry["client"].admin.command("ping")
+                ms = round((time.time() - t0) * 1000, 1)
+                shards_diag.append({"name": ventry["label"], "ok": True, "latency_ms": ms, "size_mb": vault_manager.get_db_size_mb(ventry)})
+            except Exception as e:
+                shards_diag.append({"name": ventry["label"], "ok": False, "error": str(e)[:120]})
 
         externals = []
         for label, url in [("Cloudflare Worker", config.WORKER_PROXY_HEALTH_URL), ("RWA Upstream API", config.RWA_UPSTREAM_API_URL)]:
@@ -1365,6 +1615,7 @@ class MultiMongoManager:
             "checked_at": now_ist_str(),
             "shards": shards_diag,
             "externals": externals,
+            "ram_cache": ram_cache.stats(),
             "strict_security": config.STRICT_SECURITY_ENABLED
         }
 
@@ -1406,13 +1657,16 @@ class MultiMongoManager:
 
         return {
             "connected_dbs": len(self.dbs),
+            "configured_dbs": len(config.MONGO_URIS),
             "connection_errors": self.connection_errors,
             "per_db": per_db,
+            "vault_summary": vault_manager.get_vault_summary(),
+            "ram_cache": ram_cache.stats(),
             "total_users": total_users,
             "active_today": active_today,
             "online_users": online_users,
             "logged_out_users": logged_out_users,
-            "live_radar_count": len(self.get_live_radar_users(120)),
+            "live_radar_count": len(self.get_live_radar_users(180)),
             "blocked_users": blocked_users,
             "banned_ips_count": len(self.get_banned_ips()),
             "total_tests": total_tests,
@@ -1507,14 +1761,14 @@ class MultiMongoManager:
         import io
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["User ID", "Name", "Phone", "Email", "State/District", "Status", "VIP Badge", "Streak", "Last IP", "Device", "Last Seen", "Shard"])
+        writer.writerow(["User ID", "Name", "Phone", "Email", "State/District", "Status", "VIP Badge", "Streak", "Weekly XP", "Last IP", "Device", "Last Seen", "Shard"])
         users, _ = self.get_all_users_paginated(page=1, per_page=10000)
         for u in users:
             st = "BLOCKED" if u.get("is_blocked") else ("LOGGED OUT" if u.get("is_logged_in") is False else "ONLINE")
             writer.writerow([
                 u.get("user_id", ""), u.get("name", ""), u.get("phone", ""), u.get("email", ""),
                 u.get("state_district", ""), st, u.get("vip_badge", ""), u.get("study_streak", 1),
-                u.get("last_ip", ""), u.get("last_device", ""), u.get("last_seen", ""), u.get("db_shard", "")
+                u.get("weekly_xp", 0), u.get("last_ip", ""), u.get("last_device", ""), u.get("last_seen", ""), u.get("db_shard", "")
             ])
         return buf.getvalue()
 
@@ -1524,7 +1778,7 @@ class MultiMongoManager:
             db = entry["db"]
             try:
                 backup["shards"][entry["label"]] = {
-                    "users": [clean_doc(d) for d in db.users.find()],  # stays encrypted at-rest in backup!
+                    "users": [clean_doc(d) for d in db.users.find()],
                     "user_sync": [clean_doc(d) for d in db.user_sync.find()],
                     "test_attempts": [clean_doc(d) for d in db.test_attempts.find()],
                     "admin_tokens": [clean_doc(d) for d in db.admin_tokens.find()],
