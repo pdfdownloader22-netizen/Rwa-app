@@ -6,13 +6,12 @@ import config
 from db_manager import db_manager
 from security_shield import crypto_shield, security_guard
 from vault_manager import ram_cache, vault_manager
+from vault_scanner import vault_scanner
 
 app = Flask(__name__)
 
-# Attach fallback shared shard if dedicated CONTENT_MONGO_URI is not yet set
 vault_manager.attach_fallback_dbs(db_manager.dbs)
 
-# Clean Allowed Origins from Render Environment
 config.ALLOWED_ORIGINS = [
     str(o).strip().strip('"').strip("'").rstrip("/").lower()
     for o in (config.ALLOWED_ORIGINS or [])
@@ -113,11 +112,10 @@ def enforce_ultra_security_shield():
 
     is_admin_route = request.path.startswith("/api/admin/")
 
-    # High-traffic friendly Per-IP Rate Limiter
     if request.path == "/api/login":
         allowed = security_guard.check_rate_limit(ip, bucket="login", max_req=20, window_sec=300)
     elif is_admin_route:
-        allowed = security_guard.check_rate_limit(ip, bucket="admin", max_req=180, window_sec=60)
+        allowed = security_guard.check_rate_limit(ip, bucket="admin", max_req=240, window_sec=60)
     else:
         allowed = security_guard.check_rate_limit(ip, bucket="general", max_req=160, window_sec=60)
 
@@ -126,19 +124,16 @@ def enforce_ultra_security_shield():
         trigger_async("on_security_alert", f"🚨 Rate Limit Alert\nIP: {ip}\nPath: {request.path}")
         return jsonify({"status": "error", "message": "Too many requests. Slow down."}), 429
 
-    # Direct IP Ban Check (cached in RAM)
     if not is_admin_route:
         banned, ban_reason = db_manager.is_ip_banned(ip)
         if banned:
             return sec_json({"status": "error", "ip_banned": True, "message": ban_reason or "Access denied."}, 403)
 
-    # Strict Origin Whitelist
     if not security_guard.is_origin_allowed(request):
         origin_seen = security_guard.extract_request_origin(request) or "Unknown/Direct"
         db_manager.log_error("OriginShield", f"Blocked unauthorized origin: {origin_seen} on {request.path}", user_id=ip)
         return jsonify({"status": "error", "message": f"Unauthorized origin: {origin_seen}"}), 403
 
-    # Dynamic HMAC-SHA256 Request Signature Check
     raw_body_str = request.get_data(cache=True, as_text=True) or ""
     ok_sig, sig_err = security_guard.verify_hmac_signature(request, raw_body_str)
     if not ok_sig:
@@ -177,7 +172,8 @@ def home():
         "status": "online",
         "shield": "active",
         "user_dbs": len(db_manager.dbs),
-        "vault_dbs": len(vault_manager.dbs)
+        "vault_dbs": len(vault_manager.dbs),
+        "scanner_running": vault_scanner.get_status().get("running", False)
     }), 200
 
 
@@ -431,42 +427,18 @@ def api_challenge_complete(cid):
 
 
 # =========================================================
-# DEDICATED CLOUD CONTENT VAULT APIs (AUTO-SAVE + ZERO 502 FALLBACK)
+# CLOUD CONTENT VAULT READ-ONLY FALLBACK APIs (ZERO STUDENT WRITES!)
+# Only Nightly 11PM-12AM Scheduler or Admin Panel Scan writes to Vault.
 # =========================================================
-@app.route("/api/vault/sync_series", methods=["POST"])
-def api_vault_sync_series():
-    data = get_req_json()
-    cnt = vault_manager.upsert_series_batch(data.get("series") or [])
-    return sec_json({"status": "success", "saved": cnt})
-
-
 @app.route("/api/vault/series", methods=["GET"])
 def api_vault_get_series():
     return sec_json({"status": "success", "series": vault_manager.get_all_series()})
-
-
-@app.route("/api/vault/sync_folders", methods=["POST"])
-def api_vault_sync_folders():
-    data = get_req_json()
-    cnt = vault_manager.upsert_folders_batch(data.get("series_id", ""), data.get("folders") or [])
-    return sec_json({"status": "success", "saved": cnt})
 
 
 @app.route("/api/vault/folders", methods=["GET"])
 def api_vault_get_folders():
     sid = request.args.get("series_id", "").strip()
     return sec_json({"status": "success", "folders": vault_manager.get_series_folders(sid)})
-
-
-@app.route("/api/vault/sync_titles", methods=["POST"])
-def api_vault_sync_titles():
-    data = get_req_json()
-    cnt = vault_manager.upsert_test_titles_batch(
-        data.get("series_id", ""),
-        data.get("subject_id", "-1"),
-        data.get("tests") or []
-    )
-    return sec_json({"status": "success", "saved": cnt})
 
 
 @app.route("/api/vault/titles", methods=["GET"])
@@ -476,19 +448,21 @@ def api_vault_get_titles():
     return sec_json({"status": "success", "tests": vault_manager.get_test_titles(sid, sub_id)})
 
 
-@app.route("/api/vault/save_test", methods=["POST"])
-def api_vault_save_test():
-    data = get_req_json()
-    res = vault_manager.save_full_test_payload(data)
-    return sec_json({"status": "success" if res.get("saved") else "error", **res})
-
-
 @app.route("/api/vault/test/<test_id>", methods=["GET"])
 def api_vault_get_test(test_id):
     doc = vault_manager.get_full_test_payload(test_id)
     if not doc:
         return sec_json({"status": "not_found"}, 404)
     return sec_json({"status": "success", "test_data": doc})
+
+
+# Old student write endpoints safely ignored (zero DB writes from user browsing)
+@app.route("/api/vault/sync_series", methods=["POST"])
+@app.route("/api/vault/sync_folders", methods=["POST"])
+@app.route("/api/vault/sync_titles", methods=["POST"])
+@app.route("/api/vault/save_test", methods=["POST"])
+def api_vault_student_writes_disabled():
+    return sec_json({"status": "skipped", "reason": "vault_writes_nightly_or_admin_only"})
 
 
 # =========================================================
@@ -570,10 +544,43 @@ def api_admin_stats():
     return sec_json({"status": "success", "stats": db_manager.get_cluster_stats()})
 
 
+# --- ADMIN CLOUD VAULT AUTO-SCANNER CONTROLS ---
+@app.route("/api/admin/vault/scan/status", methods=["GET"])
+@require_admin
+def api_admin_vault_scan_status():
+    return sec_json({
+        "status": "success",
+        "scan": vault_scanner.get_status(),
+        "summary": vault_manager.get_vault_summary()
+    })
+
+
+@app.route("/api/admin/vault/scan/start", methods=["POST"])
+@require_admin
+def api_admin_vault_scan_start():
+    ok, msg = vault_scanner.start_scan(mode="manual")
+    if ok:
+        db_manager.log_admin_action("VAULT_SCAN_START", "Started manual Cloud Vault Auto-Scan")
+    return sec_json({"status": "success" if ok else "error", "message": msg, "scan": vault_scanner.get_status()})
+
+
+@app.route("/api/admin/vault/scan/stop", methods=["POST"])
+@require_admin
+def api_admin_vault_scan_stop():
+    ok, msg = vault_scanner.stop_scan()
+    if ok:
+        db_manager.log_admin_action("VAULT_SCAN_STOP", "Stopped Cloud Vault Auto-Scan")
+    return sec_json({"status": "success" if ok else "error", "message": msg, "scan": vault_scanner.get_status()})
+
+
 @app.route("/api/admin/vault/summary", methods=["GET"])
 @require_admin
 def api_admin_vault_summary():
-    return sec_json({"status": "success", "summary": vault_manager.get_vault_summary()})
+    return sec_json({
+        "status": "success",
+        "summary": vault_manager.get_vault_summary(),
+        "scan": vault_scanner.get_status()
+    })
 
 
 @app.route("/api/admin/vault/series", methods=["GET"])
