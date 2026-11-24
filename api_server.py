@@ -5,10 +5,14 @@ from flask import Flask, request, jsonify, g, make_response
 import config
 from db_manager import db_manager
 from security_shield import crypto_shield, security_guard
+from vault_manager import ram_cache, vault_manager
 
 app = Flask(__name__)
 
-# Render env se aane wale extra spaces, quotes ya trailing slash auto-clean
+# Attach fallback shared shard if dedicated CONTENT_MONGO_URI is not yet set
+vault_manager.attach_fallback_dbs(db_manager.dbs)
+
+# Clean Allowed Origins from Render Environment
 config.ALLOWED_ORIGINS = [
     str(o).strip().strip('"').strip("'").rstrip("/").lower()
     for o in (config.ALLOWED_ORIGINS or [])
@@ -35,7 +39,7 @@ def trigger_async(key, *args):
 
 
 # =========================================================
-# CRASH-PROOF MANUAL CORS HANDLER (ZERO FLASK-CORS 500 BUG)
+# CRASH-PROOF MANUAL CORS HANDLER
 # =========================================================
 def _apply_cors_headers(resp):
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
@@ -72,7 +76,6 @@ def handle_unexpected_error(err):
 # E2E AES-256 ENCRYPTED REQUEST / RESPONSE HELPERS
 # =========================================================
 def get_req_json():
-    """Automatically decrypts {"enc": "iv:ciphertext"} payloads or parses JSON."""
     raw = request.get_json(silent=True)
     if not isinstance(raw, dict):
         return {}
@@ -83,7 +86,6 @@ def get_req_json():
 
 
 def sec_json(data_obj, status_code=200):
-    """Returns AES-256 encrypted JSON whenever client uses E2E tunnel (X-RWA-Enc: 1)."""
     use_enc = (request.headers.get("X-RWA-Enc") == "1")
     if use_enc:
         return jsonify(crypto_shield.encrypt_transport_dict(data_obj)), status_code
@@ -91,7 +93,7 @@ def sec_json(data_obj, status_code=200):
 
 
 # =========================================================
-# GLOBAL 3-LAYER SECURITY MIDDLEWARE (RUNS BEFORE EVERY /api/*)
+# GLOBAL 3-LAYER SECURITY MIDDLEWARE
 # =========================================================
 @app.before_request
 def enforce_ultra_security_shield():
@@ -99,7 +101,6 @@ def enforce_ultra_security_shield():
         resp = make_response("", 204)
         return _apply_cors_headers(resp)
 
-    # Render / UptimeRobot health probe (zero sensitive data exposed)
     if request.path == "/":
         return None
 
@@ -112,32 +113,32 @@ def enforce_ultra_security_shield():
 
     is_admin_route = request.path.startswith("/api/admin/")
 
-    # 1. Per-IP Rate Limiter (Anti-Spam / Render Quota Shield)
+    # High-traffic friendly Per-IP Rate Limiter
     if request.path == "/api/login":
-        allowed = security_guard.check_rate_limit(ip, bucket="login", max_req=15, window_sec=300)
+        allowed = security_guard.check_rate_limit(ip, bucket="login", max_req=20, window_sec=300)
     elif is_admin_route:
-        allowed = security_guard.check_rate_limit(ip, bucket="admin", max_req=120, window_sec=60)
+        allowed = security_guard.check_rate_limit(ip, bucket="admin", max_req=180, window_sec=60)
     else:
-        allowed = security_guard.check_rate_limit(ip, bucket="general", max_req=90, window_sec=60)
+        allowed = security_guard.check_rate_limit(ip, bucket="general", max_req=160, window_sec=60)
 
     if not allowed:
         db_manager.log_error("RateLimiter", f"Rate limit exceeded on {request.path}", user_id=ip)
         trigger_async("on_security_alert", f"🚨 Rate Limit Alert\nIP: {ip}\nPath: {request.path}")
         return jsonify({"status": "error", "message": "Too many requests. Slow down."}), 429
 
-    # 2. Direct IP Ban Check (Student routes)
+    # Direct IP Ban Check (cached in RAM)
     if not is_admin_route:
         banned, ban_reason = db_manager.is_ip_banned(ip)
         if banned:
             return sec_json({"status": "error", "ip_banned": True, "message": ban_reason or "Access denied."}, 403)
 
-    # 3. Strict Origin / Referer Whitelist Lock
+    # Strict Origin Whitelist
     if not security_guard.is_origin_allowed(request):
         origin_seen = security_guard.extract_request_origin(request) or "Unknown/Direct"
         db_manager.log_error("OriginShield", f"Blocked unauthorized origin: {origin_seen} on {request.path}", user_id=ip)
         return jsonify({"status": "error", "message": f"Unauthorized origin: {origin_seen}"}), 403
 
-    # 4. Dynamic HMAC-SHA256 Request Signature + Timestamp Check
+    # Dynamic HMAC-SHA256 Request Signature Check
     raw_body_str = request.get_data(cache=True, as_text=True) or ""
     ok_sig, sig_err = security_guard.verify_hmac_signature(request, raw_body_str)
     if not ok_sig:
@@ -155,12 +156,10 @@ def require_admin(fn):
         if banned:
             return sec_json({"status": "error", "message": f"IP temporarily banned ({wait_sec}s left)"}, 403)
 
-        # Primary: Short-Lived Signed Session Token
         sess_tok = (request.headers.get("X-Admin-Token") or "").strip()
         if sess_tok and security_guard.verify_admin_session_token(sess_tok):
             return fn(*args, **kwargs)
 
-        # Fallback: Master Key
         provided_key = (request.headers.get("X-Admin-Key") or "").strip()
         if provided_key and provided_key == config.ADMIN_PANEL_KEY:
             return fn(*args, **kwargs)
@@ -170,30 +169,45 @@ def require_admin(fn):
 
 
 # =========================================================
-# MINIMAL HEALTH PROBE (SAFE FOR RENDER / UPTIMEROBOT)
+# MINIMAL HEALTH PROBE (RENDER / UPTIMEROBOT)
 # =========================================================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "online", "shield": "active"}), 200
+    return jsonify({
+        "status": "online",
+        "shield": "active",
+        "user_dbs": len(db_manager.dbs),
+        "vault_dbs": len(vault_manager.dbs)
+    }), 200
 
 
 # =========================================================
-# STUDENT / WEBSITE SECURED APIs (E2E ENCRYPTED)
+# STUDENT / WEBSITE SECURED APIs
 # =========================================================
 @app.route("/api/portal/status", methods=["GET"])
 def api_portal_status():
     uid = request.args.get("user_id", "").strip()
     settings = db_manager.get_portal_settings()
-    blocked, reason = db_manager.is_user_blocked(uid) if uid else (False, "")
     notices = db_manager.get_active_notices(limit=10)
-    inbox = db_manager.get_user_inbox(uid, limit=20) if uid else []
-    unread_cnt = sum(1 for m in inbox if not m.get("read"))
     scheduled = db_manager.get_scheduled_mocks()
+
+    blocked, reason, unread_cnt = False, "", 0
+    if uid:
+        u_cache_key = f"ustatus:{uid}"
+        u_cached = ram_cache.get(u_cache_key)
+        if u_cached is not None:
+            blocked, reason, unread_cnt = u_cached
+        else:
+            blocked, reason = db_manager.is_user_blocked(uid)
+            inbox = db_manager.get_user_inbox(uid, limit=20)
+            unread_cnt = sum(1 for m in inbox if not m.get("read"))
+            ram_cache.set(u_cache_key, (blocked, reason, unread_cnt), ttl_sec=15)
+
     return sec_json({
         "status": "success",
         "maintenance_mode": settings["maintenance_mode"],
         "maintenance_message": settings["maintenance_message"],
-        "app_version": settings.get("app_version", "v3.0"),
+        "app_version": settings.get("app_version", "v4.0"),
         "kill_switches": settings.get("kill_switches", {}),
         "promo_popup": settings.get("promo_popup", {}),
         "user_blocked": blocked,
@@ -204,7 +218,6 @@ def api_portal_status():
     })
 
 
-# PUBLIC CLOUD TOKENS — STRICTLY "Cloud Server" LABEL ONLY + E2E ENCRYPTED
 @app.route("/api/get_tokens", methods=["GET"])
 def api_get_tokens():
     tokens = db_manager.get_all_admin_tokens(for_admin=False)
@@ -234,6 +247,7 @@ def api_login():
         "user_id": user_doc.get("user_id"),
         "session_id": session_id,
         "vip_badge": user_doc.get("vip_badge", ""),
+        "weekly_xp": user_doc.get("weekly_xp", 0),
         "blocked": bool(user_doc.get("is_blocked", False)),
         "block_reason": user_doc.get("block_reason", "")
     })
@@ -328,6 +342,7 @@ def api_user_inbox_read():
     uid = str(data.get("user_id") or "").strip()
     if uid:
         db_manager.mark_user_inbox_read(uid)
+        ram_cache.invalidate_prefix(f"ustatus:{uid}")
     return sec_json({"status": "success"})
 
 
@@ -340,7 +355,13 @@ def api_test_submit():
     if not res:
         return sec_json({"status": "error", "message": "Could not save attempt"}, 500)
     trigger_async("on_test_submit", res["attempt"], res["leaderboard"])
-    return sec_json({"status": "success", "attempt": res["attempt"], "leaderboard": res["leaderboard"]})
+    return sec_json({
+        "status": "success",
+        "attempt": res["attempt"],
+        "leaderboard": res["leaderboard"],
+        "xp_earned": res.get("xp_earned", 0),
+        "xp_info": res.get("xp_info")
+    })
 
 
 @app.route("/api/test/leaderboard", methods=["GET"])
@@ -360,6 +381,119 @@ def api_test_history():
     return sec_json({"status": "success", "history": db_manager.get_user_test_history(uid, limit=60)})
 
 
+# =========================================================
+# WEEKLY XP LEAGUE & 1-V-1 FRIEND CHALLENGE APIs
+# =========================================================
+@app.route("/api/xp/league", methods=["GET"])
+def api_xp_league():
+    uid = request.args.get("user_id", "").strip()
+    return sec_json({"status": "success", "league": db_manager.get_weekly_xp_league(uid or None, limit=25)})
+
+
+@app.route("/api/xp/add", methods=["POST"])
+def api_xp_add():
+    data = get_req_json()
+    uid = str(data.get("user_id") or "").strip()
+    pts = int(data.get("points") or 0)
+    reason = str(data.get("reason") or "Study Activity")
+    if not uid or pts <= 0:
+        return sec_json({"status": "error", "message": "user_id and positive points required"}, 400)
+    res = db_manager.add_user_xp(uid, pts, reason)
+    return sec_json({"status": "success" if res else "error", "xp": res})
+
+
+@app.route("/api/challenge/create", methods=["POST"])
+def api_challenge_create():
+    data = get_req_json()
+    if not data.get("test_id"):
+        return sec_json({"status": "error", "message": "test_id required"}, 400)
+    ch = db_manager.create_friend_challenge(data)
+    if not ch:
+        return sec_json({"status": "error", "message": "Could not create challenge"}, 500)
+    return sec_json({"status": "success", "challenge": ch})
+
+
+@app.route("/api/challenge/<cid>", methods=["GET"])
+def api_challenge_get(cid):
+    ch = db_manager.get_friend_challenge(cid)
+    if not ch:
+        return sec_json({"status": "error", "message": "Challenge not found"}, 404)
+    return sec_json({"status": "success", "challenge": ch})
+
+
+@app.route("/api/challenge/<cid>/complete", methods=["POST"])
+def api_challenge_complete(cid):
+    data = get_req_json()
+    ch = db_manager.complete_friend_challenge(cid, data)
+    if not ch:
+        return sec_json({"status": "error", "message": "Challenge not found"}, 404)
+    return sec_json({"status": "success", "challenge": ch})
+
+
+# =========================================================
+# DEDICATED CLOUD CONTENT VAULT APIs (AUTO-SAVE + ZERO 502 FALLBACK)
+# =========================================================
+@app.route("/api/vault/sync_series", methods=["POST"])
+def api_vault_sync_series():
+    data = get_req_json()
+    cnt = vault_manager.upsert_series_batch(data.get("series") or [])
+    return sec_json({"status": "success", "saved": cnt})
+
+
+@app.route("/api/vault/series", methods=["GET"])
+def api_vault_get_series():
+    return sec_json({"status": "success", "series": vault_manager.get_all_series()})
+
+
+@app.route("/api/vault/sync_folders", methods=["POST"])
+def api_vault_sync_folders():
+    data = get_req_json()
+    cnt = vault_manager.upsert_folders_batch(data.get("series_id", ""), data.get("folders") or [])
+    return sec_json({"status": "success", "saved": cnt})
+
+
+@app.route("/api/vault/folders", methods=["GET"])
+def api_vault_get_folders():
+    sid = request.args.get("series_id", "").strip()
+    return sec_json({"status": "success", "folders": vault_manager.get_series_folders(sid)})
+
+
+@app.route("/api/vault/sync_titles", methods=["POST"])
+def api_vault_sync_titles():
+    data = get_req_json()
+    cnt = vault_manager.upsert_test_titles_batch(
+        data.get("series_id", ""),
+        data.get("subject_id", "-1"),
+        data.get("tests") or []
+    )
+    return sec_json({"status": "success", "saved": cnt})
+
+
+@app.route("/api/vault/titles", methods=["GET"])
+def api_vault_get_titles():
+    sid = request.args.get("series_id", "").strip()
+    sub_id = request.args.get("subject_id", "-1").strip()
+    return sec_json({"status": "success", "tests": vault_manager.get_test_titles(sid, sub_id)})
+
+
+@app.route("/api/vault/save_test", methods=["POST"])
+def api_vault_save_test():
+    data = get_req_json()
+    res = vault_manager.save_full_test_payload(data)
+    return sec_json({"status": "success" if res.get("saved") else "error", **res})
+
+
+@app.route("/api/vault/test/<test_id>", methods=["GET"])
+def api_vault_get_test(test_id):
+    doc = vault_manager.get_full_test_payload(test_id)
+    if not doc:
+        return sec_json({"status": "not_found"}, 404)
+    return sec_json({"status": "success", "test_data": doc})
+
+
+# =========================================================
+# CONTENT HUB, NOTICES, REPORTS & ERROR LOGGING
+# =========================================================
 @app.route("/api/content/daily_quiz", methods=["GET"])
 def api_content_daily_quiz():
     return sec_json({"status": "success", "quiz": db_manager.get_daily_quiz()})
@@ -436,10 +570,66 @@ def api_admin_stats():
     return sec_json({"status": "success", "stats": db_manager.get_cluster_stats()})
 
 
+@app.route("/api/admin/vault/summary", methods=["GET"])
+@require_admin
+def api_admin_vault_summary():
+    return sec_json({"status": "success", "summary": vault_manager.get_vault_summary()})
+
+
+@app.route("/api/admin/vault/series", methods=["GET"])
+@require_admin
+def api_admin_vault_series():
+    return sec_json({"status": "success", "series": vault_manager.get_all_series()})
+
+
+@app.route("/api/admin/vault/folders/<series_id>", methods=["GET"])
+@require_admin
+def api_admin_vault_folders(series_id):
+    return sec_json({"status": "success", "folders": vault_manager.get_series_folders(series_id)})
+
+
+@app.route("/api/admin/vault/titles/<series_id>", methods=["GET"])
+@require_admin
+def api_admin_vault_titles(series_id):
+    sub_id = request.args.get("subject_id", "-1").strip()
+    return sec_json({"status": "success", "tests": vault_manager.get_test_titles(series_id, sub_id)})
+
+
+@app.route("/api/admin/vault/test/<test_id>", methods=["GET", "DELETE"])
+@require_admin
+def api_admin_vault_test(test_id):
+    if request.method == "DELETE":
+        ok = vault_manager.delete_test_from_vault(test_id)
+        if ok:
+            db_manager.log_admin_action("DELETE_VAULT_TEST", f"Deleted Test #{test_id} from Cloud Vault")
+        return sec_json({"status": "success" if ok else "error"})
+    doc = vault_manager.get_full_test_payload(test_id)
+    if not doc:
+        return sec_json({"status": "error", "message": "Full question bank not archived yet for this test."}, 404)
+    return sec_json({"status": "success", "test_data": doc})
+
+
+@app.route("/api/admin/vault/series/<series_id>", methods=["DELETE"])
+@require_admin
+def api_admin_vault_delete_series(series_id):
+    ok = vault_manager.delete_series_from_vault(series_id)
+    if ok:
+        db_manager.log_admin_action("DELETE_VAULT_SERIES", f"Deleted Series #{series_id} from Cloud Vault")
+    return sec_json({"status": "success" if ok else "error"})
+
+
+@app.route("/api/admin/cache/flush", methods=["POST"])
+@require_admin
+def api_admin_cache_flush():
+    cleared = ram_cache.clear_all()
+    db_manager.log_admin_action("FLUSH_RAM_CACHE", f"Cleared {cleared} cached keys")
+    return sec_json({"status": "success", "cleared_keys": cleared})
+
+
 @app.route("/api/admin/radar", methods=["GET"])
 @require_admin
 def api_admin_radar():
-    return sec_json({"status": "success", "live_users": db_manager.get_live_radar_users(120)})
+    return sec_json({"status": "success", "live_users": db_manager.get_live_radar_users(180)})
 
 
 @app.route("/api/admin/users", methods=["GET"])
@@ -467,6 +657,7 @@ def api_admin_user_detail(uid):
 def api_admin_user_block():
     data = get_req_json()
     ok = db_manager.set_user_blocked(data.get("user_id", ""), bool(data.get("blocked", True)), data.get("reason", ""))
+    ram_cache.invalidate_prefix(f"ustatus:{data.get('user_id', '')}")
     return sec_json({"status": "success" if ok else "error"})
 
 
@@ -491,6 +682,7 @@ def api_admin_user_vip():
 def api_admin_user_message():
     data = get_req_json()
     res = db_manager.send_personal_message(data.get("user_id", ""), data.get("title", ""), data.get("message", ""))
+    ram_cache.invalidate_prefix(f"ustatus:{data.get('user_id', '')}")
     return sec_json({"status": "success" if res else "error", "msg": res})
 
 
@@ -504,6 +696,7 @@ def api_admin_broadcast():
         data.get("message", ""),
         data.get("state_filter", "")
     )
+    ram_cache.invalidate_prefix("ustatus:")
     return sec_json({"status": "success", "sent_count": cnt})
 
 
